@@ -1,0 +1,6 @@
+**/__pycache__/
+**/.ipynb_checkpoints
+**.npy
+**vae_weights_1500m_100l.h5
+
+.DS_store
