@@ -2,28 +2,39 @@ import pandas as pd
 import numpy as np
 import os
 import csv
+import pickle
 import h5sparse
-from scipy.sparse import csc_matrix, csr_matrix, coo_matrix, vstack, hstack
+import scipy.sparse as ss
 from itertools import compress
 
 def write_gvm(gvm, output_fname, fmt='h5'):
-	if fmt == 'pd':
-		if type(gvm) != pd.DataFrame:
-			temp = pd.DataFrame(gvm['gvm'].todense())
-			if ('idx' not in gvm) or np.all(np.array(gvm['idx'] == None)):
-				gvm['idx'] = np.array(range(gvm['gvm'].shape[0]))
-			if ('col' not in gvm) or np.all(np.array(gvm['col'] == None)):
-				gvm['col'] = np.array(range(gvm['gvm'].shape[1]))
-			temp.index = gvm['idx']
-			temp.columns = gvm['col']
-			gvm = temp
+	'''
+	Writes a gvm to a .csv or .h5 file.
+
+	Parameters:
+	gvm (h5sparse): gvm to write
+	output_fname (str): file path to save to
+	fmt: format to save as. either 'csv' or 'h5'
+
+	Returns:
+	None
+	'''
+	if fmt == 'csv':
+		temp = pd.DataFrame(gvm['gvm'].todense())
+		if ('idx' not in gvm) or np.all(np.array(gvm['idx'] == None)):
+			gvm['idx'] = np.array(range(gvm['gvm'].shape[0]))
+		if ('col' not in gvm) or np.all(np.array(gvm['col'] == None)):
+			gvm['col'] = np.array(range(gvm['gvm'].shape[1]))
+		temp.index = gvm['idx']
+		temp.columns = gvm['col']
+		gvm = temp
 
 		gvm = gvm.replace(to_replace=False, value='')
 		gvm.to_csv(output_fname, sep='\t')
 
 	elif fmt == 'h5':
 		if type(gvm) == pd.DataFrame:
-			gvm = {'gvm': csc_matrix(gvm.values),
+			gvm = {'gvm': ss.csc_matrix(gvm.values),
 				   'idx': gvm.index.values,
 				   'col': gvm.columns.values}
 
@@ -50,9 +61,13 @@ def write_gvm(gvm, output_fname, fmt='h5'):
 
 def open_gvm(fname):
 	'''
-	Returns a gvm obtained from the input file.
-	fname : str
-		The name of the file to be obtained as a gvm.
+	Opens and returns the gvm at `fname`. 
+
+	Parameters:
+	fname (str): The name of the file to be obtained as a gvm.
+
+	Returns:
+	gvm (h5sparse): gvm
 	'''
 
 	with h5sparse.File(fname, 'r') as h:
@@ -71,14 +86,28 @@ def open_gvm(fname):
 	return {'gvm': data, 'idx': np.array(idx), 'col': np.array(col)}
 
 def get_gvm_size(fname):
+	'''
+	Returns the gvm shape.
+
+	Parameters:
+	fname (str): filepath of gvm
+
+	Returns:
+	gvm_size (tuple): width and height of gvm array 
+	'''
 	with h5sparse.File(fname, 'r') as h:
 		return h['gvm'].shape
 
 def file_exists(fname, warning=True):
 	'''
 	Checks if a file exists or not. Returns True or False. Prints a statement if False.
-	fname : str
-		The name of the file to check for existence.
+	
+	Parameters:
+	fname (str): The name of the file to check for existence.
+	warning (bool): print statement if file already created?
+
+	Returns:
+	does_file_exist (bool):
 	'''
 	if type(fname) not in [str, bytes, os.PathLike]: return False
 	if os.path.isfile(fname):
@@ -87,6 +116,20 @@ def file_exists(fname, warning=True):
 	else: return False
 
 def format_gene_names(names, pct_commas_threshold=.1, pct_uds_threshold=.1, verbose=True):
+	'''
+	For a list-like object of gene names, uppercases and removes whitespace.
+	Also removes suffixes if >10% names have commas or underscores.
+
+	Parameters:
+	names (list-like): list of gene names (str)
+	pct_commas_threshold (float): between 0 and 1. all pre-comma suffixes will be removed if more than this proportion
+	of gene names have commas.
+	pct_uds_threshold (float): between 0 and 1. all pre-underscore suffixes will be removed if more than this proportion
+	of gene names have underscores.
+
+	Returns:
+	names (lsit-like): list of formatted gene names
+	'''
 
 	# Uppercase and remove whitespace.
 	names = np.char.strip(np.char.upper(np.array(names, dtype='str')))
@@ -107,31 +150,41 @@ def format_gene_names(names, pct_commas_threshold=.1, pct_uds_threshold=.1, verb
 
 	return names
 
-def transpose_gvm(gvm):		
+def transpose_gvm(gvm):	
+	'''
+	Transposes and returns a gvm.
+	'''	
 	gvm['gvm'] = gvm['gvm'].transpose()
 	gvm['idx'], gvm['col'] = (gvm['col'], gvm['idx'])
 
 	return gvm
 
-def merge_updn_gvms(gvm1, gvm2, label_sep='__'):
-	'''Identically-named indices, with some indices possibly missing (due to removal).'''
+def merge_updn_gvms(gvm1, gvm2):
+	'''
+	Concatenates gvm1 and gvm2, taking the union of the gene sets for repeated terms.
+	gvm1 and gvm2 should have identical column gene-indices. 
+
+	Returns:
+	gvm (h5sparse)
+	'''
 	if len(gvm1['col']) != len(gvm2['col']): raise ValueError('gvms must have same column length.')
 	if np.any(gvm1['col'] != gvm2['col']): raise ValueError('gene column-index must be identical.')
 	
 	n_genes = gvm1['gvm'].shape[1]
 	missing_from_gvm2 = gvm1['idx'][~np.isin(gvm1['idx'], gvm2['idx'])]
 	missing_from_gvm1 = gvm2['idx'][~np.isin(gvm2['idx'], gvm1['idx'])]
-		
+	
+	# Pad missing terms for gvm1 and gvm2. 
 	gvm1['idx'] = np.append(gvm1['idx'], missing_from_gvm1)
-	missing_rows = csr_matrix( np.full(fill_value=False, shape=(len(missing_from_gvm1), n_genes)) )
-	gvm1['gvm'] = csr_matrix( vstack([gvm1['gvm'], missing_rows]) )
+	missing_rows = ss.csr_matrix( np.full(fill_value=False, shape=(len(missing_from_gvm1), n_genes)) )
+	gvm1['gvm'] = ss.csr_matrix( ss.vstack([gvm1['gvm'], missing_rows]) )
 	idx_sorting = np.argsort(gvm1['idx'])
 	gvm1['gvm'] = gvm1['gvm'][idx_sorting,:]
 	gvm1['idx'] = gvm1['idx'][idx_sorting]
 	
 	gvm2['idx'] = np.append(gvm2['idx'], missing_from_gvm2)
-	missing_rows = csr_matrix( np.full(fill_value=False, shape=(len(missing_from_gvm2), n_genes)) )
-	gvm2['gvm'] = csr_matrix( vstack([gvm2['gvm'], missing_rows]) )
+	missing_rows = ss.csr_matrix( np.full(fill_value=False, shape=(len(missing_from_gvm2), n_genes)) )
+	gvm2['gvm'] = ss.csr_matrix( ss.vstack([gvm2['gvm'], missing_rows]) )
 	idx_sorting = np.argsort(gvm2['idx'])
 	gvm2['gvm'] = gvm2['gvm'][idx_sorting,:]
 	gvm2['idx'] = gvm2['idx'][idx_sorting]
@@ -139,13 +192,18 @@ def merge_updn_gvms(gvm1, gvm2, label_sep='__'):
 	assert np.all(gvm1['idx'] == gvm2['idx'])
 	assert np.all(gvm1['gvm'].shape == gvm2['gvm'].shape)
 
+	# Take the union.
 	gvm = dict()
-	gvm['gvm'] = csr_matrix(gvm1['gvm'], dtype=bool) + csr_matrix(gvm2['gvm'], dtype=bool)
-	gvm['idx'] = gvm1['idx']
+	gvm['gvm'] = ss.csr_matrix(gvm1['gvm'], dtype=bool) + ss.csr_matrix(gvm2['gvm'], dtype=bool)
+	gvm['idx'], gvm['col'] = gvm1['idx'], gvm1['col']
 
 	return gvm
 
 def merge_dup_gene_names(gvm, verbose=False):
+	'''
+	Takes in a gvm and returns it after merging column gene-indices with the
+	same name are merged by taking their union.
+	'''
 
 	# TODO: edit code so transpose is not necessary.
 	gvm = transpose_gvm(gvm)
@@ -162,14 +220,14 @@ def merge_dup_gene_names(gvm, verbose=False):
 	# Add duplicate gene-rows together.
 	Mat_data = np.ones(shape=(len(idx),))
 	Mat_xy = ([gene_id[g] for g in idx], range(len(idx)))
-	Mat = coo_matrix((Mat_data, Mat_xy), shape=(len(gene_id), len(idx)))
+	Mat = ss.coo_matrix((Mat_data, Mat_xy), shape=(len(gene_id), len(idx)))
 	data = Mat * data
 	# Replace all nonzero entries with one.
 	# Overall, this is equivalent to taking the union.
 	data.data = np.ones(shape=(len(data.data),), dtype=int)
 
 	gvm['idx'] = unique_genes
-	gvm['gvm']	 = csc_matrix(data, dtype=bool)
+	gvm['gvm']	 = ss.csc_matrix(data, dtype=bool)
 
 	gvm = transpose_gvm(gvm)
 
@@ -189,13 +247,14 @@ def get_genesetlist(item, item_type):
 	item : str (gmt file name or gvm file name), pd.DataFrame (gvm), or pd.Series (interaction list)
 		The item to obtain as a geneset list.
 	item_type : str
-		Indicates the type of `item`. One of: "gmt_fname", "gvm_fname", or "interactionlist"/"ilist".
+		Indicates the type of `item`. One of: "gmt_fname", "gvm", "gvm_fname", or "interactionlist"/"ilist".
 	'''
 	if item_type == 'gmt_fname':
 		gmt_fname = item
 		with open(gmt_fname, 'r') as f:
 			reader = csv.reader(f, delimiter = '\t')
-			d = {row[0]:sorted(set([str(g) for g in row[2:] if g != ''])) for row in reader}
+			# This will remove everything after the first comma!
+			d = {row[0]:sorted(set([str(g).split(',')[0] for g in row[2:] if g != ''])) for row in reader}
 			return pd.Series(d).sort_index()
 
 	elif item_type in ['interactionlist', 'ilist']:
@@ -241,8 +300,8 @@ def convert_genesetlist(gslist, to, output_fname = None, verbose = False):
 		all_genes_set = {item for sublist in gslist for item in sublist}
 		all_genes = pd.Series(sorted(all_genes_set))
 		gslist = gslist.apply(set)
-		gvm = [csr_matrix(all_genes.isin(gs), dtype=bool) for gs in gslist]
-		gvm = vstack(gvm)
+		gvm = [ss.csr_matrix(all_genes.isin(gs), dtype=bool) for gs in gslist]
+		gvm = ss.vstack(gvm)
 
 		gvm = {'gvm':gvm, 'idx':gslist.index, 'col':all_genes}
 		if output_fname is not None: write_gvm(gvm, output_fname, fmt='h5')
@@ -252,7 +311,34 @@ def convert_genesetlist(gslist, to, output_fname = None, verbose = False):
 
 def format_gvm_h5(gvm_fname, all_genes, output_fname, min_gs_size = 3, max_gs_loss=.5,
 				 verbose=True, overwrite=True, return_value='summary'):
+	'''
+	Uses `all_genes` to re-format the gvm stored at `gvm_fname`. 
 
+	Formatting will:
+		be skipped, if a previously-made formatted gvm exists.
+		capitalize gene names.
+		remove gene name suffixes, if > 10% of gene names have commas or underscores. (e.g. 'AATF,1.0' --> 'AATF).
+		convert gene names to HUGO identifiers.
+		discard unconvertible gene names.
+		discard "rare" genes: genes not included in the ~20,000 used to train the VAE.
+		take the union for genes mapped onto the same HUGO identifier.
+		drop samples which have less than `min_gs_size` genes, or have lost more than `max_gs_loss` of their genes.
+		re-label the gene index with numerical gene IDs (gene names can be recovered with gene_name_conversion.tsv).
+		re-order the column and row indices.
+		save the new gvm to formatted_gvm_fname
+
+	Parameters:
+	gvm_fname (str)
+	all_genes (pd.DataFrame): HUGO gene name/ID table created by 'notebooks/0_merge_libraries.ipynb' 
+	output_fname (str)
+
+	Returns:
+	summary (dict):
+		formatted gvm shape (tuple)
+		genes removed (int)
+		genes mapped to same symbol (int)
+		labels removed (int)
+	'''
 	if not overwrite:
 		if os.path.isfile(output_fname):
 			print('%s already created.' %output_fname)
@@ -265,8 +351,9 @@ def format_gvm_h5(gvm_fname, all_genes, output_fname, min_gs_size = 3, max_gs_lo
 
 	n_labels, n_genes = gvm['gvm'].shape
 	genes_per_label = np.squeeze(np.asarray(gvm['gvm'].sum(axis=1)))
+	original_gene_names = gvm['col']
 
-	# Capitalize. Remove suffixes, if > 10% of gene names have commas or underscores.
+	# Capitalize. Remove suffixes, if > 10% of gene names have commas.
 	gvm['col'] = np.array(format_gene_names(gvm['col']))
 
 	# Replace gene index with gene IDs.
@@ -279,7 +366,11 @@ def format_gvm_h5(gvm_fname, all_genes, output_fname, min_gs_size = 3, max_gs_lo
 	gvm['gvm'] = gvm['gvm'][:,col_keep]
 	gvm['col'] = gvm['col'][col_keep]
 	n_genes_lost = n_genes - gvm['gvm'].shape[1]
-	if verbose: print('\t%d out of %d genes were removed.' % (n_genes_lost, n_genes))
+	if verbose: 
+		print('\t%d out of %d genes were removed:' % (n_genes_lost, n_genes))
+		removed_genes_preview = '\t\t' + ' '.join(original_gene_names[col_keep][:5])
+		if len(col_keep) > 5: print(removed_genes_preview + '...')
+		else: print(removed_genes_preview)
 
 	#Take union for genes mapped onto one another.
 	genes_mapped_same_symbol = len(gvm['col']) - len(set(gvm['col']))
@@ -302,8 +393,8 @@ def format_gvm_h5(gvm_fname, all_genes, output_fname, min_gs_size = 3, max_gs_lo
 	gvm['col'] = gvm['col'].astype('int64')
 	all_valid_genes = all_genes['gene id'][all_genes['gene id'] != -1]
 	missing_genes = list(set(all_valid_genes) - set(gvm['col']))
-	missing_cols = csr_matrix( np.full(fill_value=False, shape=(gvm['gvm'].shape[0], len(missing_genes))) )
-	gvm['gvm'] = csr_matrix(hstack([gvm['gvm'], missing_cols]))
+	missing_cols = ss.csr_matrix( np.full(fill_value=False, shape=(gvm['gvm'].shape[0], len(missing_genes))) )
+	gvm['gvm'] = ss.csr_matrix(ss.hstack([gvm['gvm'], missing_cols]))
 	gvm['col'] = np.append(gvm['col'], np.array(missing_genes))
 	col_sorting = np.argsort(gvm['col'])
 	gvm['gvm'] = gvm['gvm'][:,col_sorting]

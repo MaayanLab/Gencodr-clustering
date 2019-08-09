@@ -2,9 +2,7 @@ import numpy as np
 import h5py
 import h5sparse
 
-import scipy.sparse as sparse
 from scipy.stats import norm
-
 from sklearn.preprocessing import normalize
 
 from keras.models import Sequential, Model
@@ -18,6 +16,18 @@ from keras.callbacks import Callback
 from time import sleep
 
 def partition(all_labs, method='lib holdout', holdout=None, pct=.05, seed=None):
+	'''
+	partitions all the samples into a test and train set. 
+
+	all_labs (pd.DataFrame): table of sample labels (i.e. annotations) made by `scripts/0_merge_libraries.ipynb`
+	method (str): one of
+		'lib holdout': uses one library for the test set, and the rest for the train set
+		'balanced pct': uses `pct` of each library for the test set, and the rest for the train set
+		'pct'
+	holdout (str): Optional. The library to holdout if method=='lib holdout'. If None, chosen randomly.
+	pct (float): 0 to 1. Proportion to reserve for the test set if method=='balanced pct'
+	seed (int): seed for RNG
+	'''
 	libs = list(set(all_labs['lib name']))
 
 	if method=='lib holdout':
@@ -42,15 +52,18 @@ def partition(all_labs, method='lib holdout', holdout=None, pct=.05, seed=None):
 		np.random.seed(seed)
 		test = p.random.choice(a=(False, True), size=(all_labs.shape[0],), p=(pct, 1-pct))
 
+	else: raise NotImplementedError('method should be "lib holdout" or "balanced pct"')
+
 	part = {'train': all_labs.index.values[~test], 'test': all_labs.index.values[test]}
 	return part
 
 class GeneVec_Generator(Sequence):
-	'Generates batches of data for Keras'
-	#Assumes individual gvms fit in memory.
-	# Adaptation of:
-	# ttps://stanford.edu/~shervine/blog/keras-how-to-generate-data-on-the-fly
-	# Afshine Amidi and Shervine Amidi
+	'''
+	Generates batches of data for Keras
+	Assumes individual gvms fit in memory.
+	Source: ttps://stanford.edu/~shervine/blog/keras-how-to-generate-data-on-the-fly
+	Afshine Amidi and Shervine Amidi
+	'''
 
 	def __init__(self, gvm_part_fname, gvm_path, indices=None,
 			batch_size=128, shuffle = True, verbose = True, norm=False):
@@ -83,7 +96,7 @@ class GeneVec_Generator(Sequence):
 		label_indices = self.indices[
 			(batch_index*self.batch_size):(
 			(batch_index+1)*self.batch_size)]
-		X = self.GVD[label_indices,:].todense() # no todense required.
+		X = self.GVD[label_indices,:].todense() # no todense required?
 		if self.normalize: X = normalize(X)
 		return X, X
 
@@ -92,6 +105,7 @@ class GeneVec_Generator(Sequence):
 		if self.shuffle: np.random.shuffle(self.indices)
 
 def compute_kernel(x, y, sigma_sqr):
+	'''Helper function for `compute_mmd`'''
 	x_size = K.shape(x)[0]
 	y_size = K.shape(y)[0]
 	dim = K.shape(x)[1]
@@ -102,23 +116,34 @@ def compute_kernel(x, y, sigma_sqr):
 	# n samples
 
 def compute_mmd(x, y, sigma_sqr=1.):
+	'''
+	Computes the Maximum Mean-Discrepancy.
+	(It runs, but I haven't confirmed this code is correct.)
+	Source: https://ermongroup.github.io/blog/a-tutorial-on-mmd-variational-autoencoders/
+	Shengjia Zhao
+
+	Parameters:
+		x (tensor)
+		y (tensor)
+	'''
 	x_kernel = compute_kernel(x, x, sigma_sqr)
 	y_kernel = compute_kernel(y, y, sigma_sqr)
 	xy_kernel = compute_kernel(x, y, sigma_sqr)
 	return K.mean(x_kernel) + K.mean(y_kernel) - 2 * K.mean(xy_kernel)
-	# single value
 
 # reparameterization trick
 # instead of sampling from Q(z|X), sample eps = N(0,I)
-# z = z_mu + sqrt(var)*eps
 def sampling(args):
-	"""Reparameterization trick by sampling from an isotropic unit Gaussian.
-	# Arguments
+	'''
+	Reparameterization trick by sampling from eps = N(0, I).
+	z = z_mu + sqrt(var)*eps
+
+	Parameters:
 		args (tensor): mean and log of variance of Q(z|X)
 
-	# Returns
+	Returns:
 		z (tensor): sampled latent vector
-	"""
+	'''
 
 	z_mu, z_log_var = args
 	batch = K.shape(z_mu)[0]
@@ -127,11 +152,30 @@ def sampling(args):
 	return z_mu + K.exp(0.5 * z_log_var) * epsilon
 
 def build_vae(input_dim, middle_dim=1000, latent_dim=100, regularizer='KL',
-	epsilon_std=1.0, h_act = 'relu', variational=False, DROPOUT_RATE=0,
+	h_act = 'relu', variational=False, DROPOUT_RATE=0,
 	epochs=30, BETA_START=0, optimizer='Adamax', LEARNING_RATE=.001, sparse=None,
 	POSCLASS_ETA=None, MMD_SIGMA_SQR=None, MMD_SCALE=None):
+	'''
+	Wrapper for building the Keras (V)AE model.
 	# http://louistiao.me/posts/implementing-variational-autoencoders-in-keras-beyond-the-quickstart-tutorial/
-
+	
+	Parameters:
+		input_dim (int): The dimensionality of the input
+		middle_dim (int): The dim. of the intermediate dimensions of the encoder and decoder
+		latent_dim (int): The dim. of the latent space
+		regularizer (str): 'MMD' or 'KL'. (for the AE, is computed but not added to loss function.)
+		h_act (str): Keras activation. https://keras.io/activations/
+		variational (bool): VAE?
+		DROPOUT_RATE (float): 0 to 1. If > 0, adds a dropout layer with this rate to the input layer.
+		epochs (int): # epochs to run for (unless EarlyStopping occurs)
+		BETA_START (int): The initial multiplier for the regularizer loss (if VAE).
+		optimizer (str): Must be 'Adamax' or 'Adam': the optimizer used to train the autoencoder.
+		LEARNING_RATE (float): the learning rate
+		sparse (bool): sparse? if so, adds a l1(sparse) activity regularizer to the latent layer.
+		POSCLASS_ETA (float): the loss function for indices == 0 is multiplied by (1 + POSCLASS_ETA).
+		MMD_SIGMA_SQR: the sigma squared value for the MMD regularizer.
+		MMD_SCALE: the scale value for the MMD regularizer.
+	'''
 	opt_dict = {'Adam': Adam, 'Adamax': Adamax}
 	optimizer = opt_dict[optimizer]
 
@@ -221,3 +265,117 @@ def build_vae(input_dim, middle_dim=1000, latent_dim=100, regularizer='KL',
 
 	out = {'vae': vae, 'enc': enc, 'dec': dec, 'beta': beta}
 	return out
+
+class PatchedModelCheckpoint(Callback):
+	"""
+	https://github.com/keras-team/keras/issues/11101#issuecomment-502023233
+	Save the model after every epoch.
+	`filepath` can contain named formatting options,
+	which will be filled with the values of `epoch` and
+	keys in `logs` (passed in `on_epoch_end`).
+	For example: if `filepath` is `weights.{epoch:02d}-{val_loss:.2f}.hdf5`,
+	then the model checkpoints will be saved with the epoch number and
+	the validation loss in the filename.
+	# Arguments
+		filepath: string, path to save the model file.
+		monitor: quantity to monitor.
+		verbose: verbosity mode, 0 or 1.
+		save_best_only: if `save_best_only=True`,
+			the latest best model according to
+			the quantity monitored will not be overwritten.
+		save_weights_only: if True, then only the model's weights will be
+			saved (`model.save_weights(filepath)`), else the full model
+			is saved (`model.save(filepath)`).
+		mode: one of {auto, min, max}.
+			If `save_best_only=True`, the decision
+			to overwrite the current save file is made
+			based on either the maximization or the
+			minimization of the monitored quantity. For `val_acc`,
+			this should be `max`, for `val_loss` this should
+			be `min`, etc. In `auto` mode, the direction is
+			automatically inferred from the name of the monitored quantity.
+		period: Interval (number of epochs) between checkpoints.
+	"""
+
+	def __init__(self, filepath, monitor='val_loss', verbose=0,
+				 save_best_only=False, save_weights_only=False,
+				 mode='auto', period=1):
+		super(PatchedModelCheckpoint, self).__init__()
+		self.monitor = monitor
+		self.verbose = verbose
+		self.filepath = filepath
+		self.save_best_only = save_best_only
+		self.save_weights_only = save_weights_only
+		self.period = period
+		self.epochs_since_last_save = 0
+
+		if mode not in ['auto', 'min', 'max']:
+			warnings.warn('ModelCheckpoint mode %s is unknown, '
+						  'fallback to auto mode.' % (mode),
+						  RuntimeWarning)
+			mode = 'auto'
+
+		if mode == 'min':
+			self.monitor_op = np.less
+			self.best = np.Inf
+		elif mode == 'max':
+			self.monitor_op = np.greater
+			self.best = -np.Inf
+		else:
+			if 'acc' in self.monitor or self.monitor.startswith('fmeasure'):
+				self.monitor_op = np.greater
+				self.best = -np.Inf
+			else:
+				self.monitor_op = np.less
+				self.best = np.Inf
+
+	def on_epoch_end(self, epoch, logs=None):
+		logs = logs or {}
+		self.epochs_since_last_save += 1
+		if self.epochs_since_last_save >= self.period:
+			self.epochs_since_last_save = 0
+			filepath = self.filepath.format(epoch=epoch + 1, **logs)
+			if self.save_best_only:
+				current = logs.get(self.monitor)
+				if np.isnan(current): raise ValueError('nan loss.')
+				if current is None:
+					warnings.warn('Can save best model only with %s available, '
+								  'skipping.' % (self.monitor), RuntimeWarning)
+				else:
+					if self.monitor_op(current, self.best):
+						if self.verbose > 0:
+							print('\nEpoch %05d: %s improved from %0.5f to %0.5f,'
+								  ' saving model to %s'
+								  % (epoch + 1, self.monitor, self.best,
+									 current, filepath))
+						self.best = current
+
+						saved_correctly = False
+						while not saved_correctly:
+							try:
+								if self.save_weights_only:
+									self.model.save_weights(filepath, overwrite=True)
+								else:
+									self.model.save(filepath, overwrite=True)
+								saved_correctly = True
+							except Exception as error:
+								print('Error while trying to save the model: {}.\nTrying again...'.format(error))
+								sleep(3)
+					else:
+						if self.verbose > 0:
+							print('\nEpoch %05d: %s did not improve from %0.5f' %
+								  (epoch + 1, self.monitor, self.best))
+			else:
+				if self.verbose > 0:
+					print('\nEpoch %05d: saving model to %s' % (epoch + 1, filepath))
+				saved_correctly = False
+				while not saved_correctly:
+					try:
+						if self.save_weights_only:
+							self.model.save_weights(filepath, overwrite=True)
+						else:
+							self.model.save(filepath, overwrite=True)
+						saved_correctly = True
+					except Exception as error:
+						print('Error while trying to save the model: {}.\nTrying again...'.format(error))
+						sleep(5)
