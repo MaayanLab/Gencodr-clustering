@@ -1,4 +1,4 @@
-# Encodr-clustering
+# Gencodr-clustering
 
 Uses [Gencodr](https://github.com/MaayanLab/Gencodr) to embed a gmt's genesets into a latent space for visualization.
 
